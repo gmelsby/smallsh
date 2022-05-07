@@ -5,17 +5,15 @@
 // Due Date: 05/09/2022
 // Description: Shell that can run basic commands
 
-#include <stdlib.h>
-#include <stdint.h>
+#include <stdlib.h> // malloc, realloc, free, exit, etc
+#include <stdint.h> // intmax_t
 #include <fcntl.h> // open, close
 #include <stdio.h> // printf, fprintf, etc
 #include <sys/types.h> // pid_t
-#include <dirent.h>
 #include <unistd.h> // getpid, fork
-#include <string.h>
-#include <libgen.h>
-#include <sys/wait.h>
-#include <signal.h>
+#include <string.h> // size_t, strlen, etc
+#include <sys/wait.h> // waitpid
+#include <signal.h> // sigset_t, kill, signal processing
 
 // maximum number of characters the command line will read
 const int MAX_LINE_LEN = 2048;
@@ -34,11 +32,54 @@ struct inputparts {
   char* args[512];
   };
 
+// struct to store information about currently running background processes
 struct backgroundprocesses {
   int count;
-  pid_t processes[5];
+  pid_t processes[30];
 };
 
+// tracks whether '&' at the end will cause the command to run in the background
+volatile sig_atomic_t background_capacity = 1;
+
+// prototype for background_on so background_off recognizes function when compling
+void background_on(int signal);
+
+/*
+ * Signal handler to toggle off background process capacity with '&'
+ *
+ */
+void background_off(int signal) {
+  char* output = "\nEntering foreground-only mode (& is now ignored)\n:";
+  background_capacity = 0;
+  write(STDOUT_FILENO, output, 51);
+  signal++;
+  struct sigaction sigtstp_action;
+  memset(&sigtstp_action, 0, sizeof sigtstp_action);
+  sigtstp_action.sa_handler = background_on;
+  sigfillset(&(sigtstp_action.sa_mask));
+  sigtstp_action.sa_flags = SA_RESTART;
+
+  sigaction(SIGTSTP, &sigtstp_action, NULL);
+
+}
+
+/*
+ * Signal handler to toggle on background process capacity with '&'
+ *
+ */ 
+void background_on(int signal) {
+  char* output = "\nExiting foreground-only mode\n:";
+  background_capacity = 1;
+  write(STDOUT_FILENO, output, 31);
+  signal++;
+  struct sigaction sigtstp_action;
+  memset(&sigtstp_action, 0, sizeof sigtstp_action);
+  sigtstp_action.sa_handler = background_off;
+  sigfillset(&(sigtstp_action.sa_mask));
+  sigtstp_action.sa_flags = SA_RESTART;
+
+  sigaction(SIGTSTP, &sigtstp_action, NULL);
+}
 
 
 /*
@@ -47,8 +88,7 @@ struct backgroundprocesses {
  *
  */
 int parseargs(struct inputparts *in) {
-  fprintf(stderr, "in.args[0]: %s\n", (*in).args[0]);
-  fflush(stderr);
+  printf("%d", (*in).background);
   return(0);
 }
 
@@ -59,10 +99,6 @@ int parseargs(struct inputparts *in) {
  * @returns 0 if successful
  */
 int expandargs(struct inputparts *in) {
-  fprintf(stderr, "expanding args\n");
-  fprintf(stderr, "in.args[0]: %s\n", (*in).args[0]);
-  fflush(stderr);
-
   pid_t pid = getpid();
   char* pidstr;
   // write to null to get the length of the string
@@ -96,7 +132,6 @@ int expandargs(struct inputparts *in) {
 
         // if the character after is '$' copy the current pid as a string into result
         if (after_next_char == '$') {
-          fprintf(stderr, "Parsed $$");
           tempstr = realloc(tempstr, tempstr_len + pidstr_len);
           tempstr_len += pidstr_len;
           strcpy(&tempstr[tempstr_idx], pidstr);
@@ -105,7 +140,6 @@ int expandargs(struct inputparts *in) {
 
         // otherwise just copy both characters as they are
         else {
-          fprintf(stderr, "Parsed single $, next character is %c", after_next_char);
           tempstr[tempstr_idx] = next_char;
           tempstr[tempstr_idx + 1] = after_next_char;
           tempstr_idx += 2;
@@ -152,13 +186,50 @@ int main() {
   struct backgroundprocesses bp;
   memset(&bp, 0, sizeof bp);
 
+
   // stores the exit status of the last foreground process
   int exitstatus = 0;
 
-  // tracks whether '&' at the end will cause the command to run in the background
-  _Bool background_capacity = 1;
+  // sets up signal handler for SIGTSTP
+  struct sigaction sigtstp_action;
+  memset(&sigtstp_action, 0, sizeof sigtstp_action);
+  sigtstp_action.sa_handler = background_off;
+  sigfillset(&(sigtstp_action.sa_mask));
+  sigtstp_action.sa_flags = SA_RESTART;
+
+  sigaction(SIGTSTP, &sigtstp_action, NULL);
+
+  // sets up ignore for SIGINT
+  struct sigaction sigint_action;
+  memset(&sigint_action, 0, sizeof sigint_action);
+  sigint_action.sa_handler = SIG_IGN;
+  sigfillset(&(sigint_action.sa_mask));
+  sigint_action.sa_flags = SA_RESTART;
+
+  sigaction(SIGINT, &sigint_action, NULL);
 
   while(1) {
+    // checks the current background processes to see if they have terminated
+    for (int i = 0; i < bp.count;) {
+      pid_t child_pid = bp.processes[i];
+      int background_status;
+      if (waitpid(child_pid, &background_status, WNOHANG)) {
+        if (WIFEXITED(background_status)) {
+          printf("background pid %jd is done: exit value %d\n", (intmax_t) child_pid, WEXITSTATUS(background_status));
+        }
+        if (WIFSIGNALED(background_status)) {
+          printf("background pid %jd is done: terminated by signal %d\n", (intmax_t) child_pid, WTERMSIG(background_status));
+        }
+        for (int j = i; j < bp.count - 1; j++) {
+          bp.processes[j] = bp.processes[j+1];
+        }
+        bp.processes[bp.count - 1] = 0;
+        bp.count--;
+      }
+      else {
+        i++;
+      }
+    }
     // clears the string that will hold command line input
     memset(instring, '\0', MAX_LINE_LEN + 1);
 
@@ -194,8 +265,12 @@ int main() {
     // checks if the last character is '&'
     // if so sets the command to run in background
     // we then move the null terminator one char earlier to replace '&'
-    if (background_capacity == 1 && strlen(instring) > 1 && instring[strlen(instring) - 1] == '&' && instring[strlen(instring) - 2] == ' ') {
-      in.background = 1;
+    if (strlen(instring) > 1 && instring[strlen(instring) - 1] == '&' && instring[strlen(instring) - 2] == ' ') {
+      // sets command to run in background if background_capacity is enabled
+      if (background_capacity) {
+        in.background = 1;
+      }
+      // removes the '& even if background_capacity is not on
       instring[strlen(instring) - 1] = '\0';
     }
 
@@ -248,21 +323,15 @@ int main() {
     // implement string expansion
     expandargs(&in);
     
-    // print diagnostics
-    if (in.arg_count > 0) {
-      fprintf(stderr, "COMMAND: [%s]\n", in.args[0]);
-      for (int i=1;i<in.arg_count;i++) {
-        fprintf(stderr, "ARG %d: [%s]\n", i, in.args[i]);
-      }
-      fprintf(stderr, "INPUT: [%s]\n", in.instream);
-      fprintf(stderr, "OUTPUT: [%s]\n", in.outstream);
-    }
-
-
 
     // implements exit command
     // needs to end child processes when those are implemented
     if (in.arg_count && !strcmp(in.args[0], "exit")) {
+        for (int i = 0; i < bp.count; i++) {
+          if (kill(bp.processes[i], SIGTERM) == -1) {
+            fprintf(stderr, "Could not terminate background pid %jd\n", (intmax_t) bp.processes[i]);
+          }
+        }
         free(instring);
         for (int i = 0; i < in.arg_count; i++) {
           free(in.args[i]);
@@ -272,13 +341,9 @@ int main() {
 
     // implements cd command
     else if (in.arg_count && !strcmp(in.args[0], "cd")) {
-      fprintf(stderr, "changing directory\n");
-      fflush(stderr);
 
       // if cd is entered by itself goes to the home directory in environment
       if (in.arg_count == 1) {
-        fprintf(stderr, "changing to home dir\n");
-        fflush(stderr);
 
         // see if HOME is set in env, if so set it to homedir and change directory to it
         char *homedir = getenv("HOME");
@@ -311,12 +376,18 @@ int main() {
 
     // implement status capacity
     else if (in.arg_count && !strcmp(in.args[0], "status")) {
-      fprintf(stdout, "%i\n", exitstatus);
+      fprintf(stdout, "exit value %i\n", exitstatus);
       fflush(stdout);
     }
 
     // implement exec capacity
     else {
+      // checks that there will not be more than 30 background processes
+      if (in.background && bp.count >= 30) {
+        fprintf(stderr, "Too many background processes already! Try again when one has terminated.\n");
+        continue;
+      }
+
       // forks to create a child process
       pid_t fork_pid = fork(); 
       int child_status;
@@ -328,10 +399,34 @@ int main() {
 
       // case where we are in the child process
       else if (fork_pid == 0) {
+        // sets up ignore for SIGTSTP
+        sigtstp_action.sa_handler = SIG_IGN;
+        sigfillset(&(sigtstp_action.sa_mask));
+        sigtstp_action.sa_flags = SA_RESTART;
+
+        sigaction(SIGTSTP, &sigtstp_action, NULL);
+
+        // if command is to be run in foreground, sets up default behavior for SIGINT
+        if (!in.background) {
+          sigint_action.sa_handler = SIG_DFL;
+          sigfillset(&(sigint_action.sa_mask));
+          sigint_action.sa_flags = SA_RESTART;
+
+          sigaction(SIGINT, &sigint_action, NULL);
+        }
+        
+        // redirects stderr if command is to be executed in background
+        else {
+          int new_erroutput = open("/dev/null", O_WRONLY);
+          dup2(new_erroutput, STDERR_FILENO);
+        }
+
         // handle redirection if necessary
         int new_input;
         int new_output;
-        
+          
+       
+ 
         // handles input redirection
         if (in.instream != NULL || in.background) {
           // case where input redirection is passed in
@@ -371,16 +466,15 @@ int main() {
           // redirects output
           dup2(new_output, STDOUT_FILENO);
         }
-
+       
         // exec function to run the command with arguments
         execvp(in.args[0], in.args); 
         
         // if we are still in the child process an error has occured
         fprintf(stderr, "Command could not be executed\n");
         exit(1);
-
-
       }
+      
       // case where we are in the parent process
       else {
         // waits if command is not to be executed in background
@@ -392,25 +486,24 @@ int main() {
             exitstatus = WEXITSTATUS(child_status);
           }
 
-          // updates exit status if child exited abnormally
-          if (WIFSIGNALED(child_status) {
+          // updates and prints exit status if child exited abnormally
+          if (WIFSIGNALED(child_status)) {
               exitstatus = WTERMSIG(child_status);
+              fprintf(stdout, "%d\n", exitstatus);
+              fflush(stdout);
           }
 
         }
         // executes command in background
         else {
-          waitpid(fork_pid, &child_status, WNOHANG);
-          fprintf(stdout,"%jd\n", (intmax_t) fork_pid);
+          fprintf(stdout,"background pid is %jd\n", (intmax_t) fork_pid);
           fflush(stdout);
+          bp.processes[bp.count] = fork_pid;
           bp.count++;
         }
       }
     }
     
-    // implement signal handling
-    // implement background processes
-
     // free every non-null pointer in in.args
     for (int i = 0; i < in.arg_count; i++) {
       free(in.args[i]);
